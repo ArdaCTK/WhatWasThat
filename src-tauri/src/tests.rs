@@ -311,7 +311,7 @@ mod tests {
 
         db.save_correction(&UserCorrection {
             screenshot_id: "ss-1".into(),
-            old_category: "Other".into(),
+            old_category: Some("Other".into()),   // FIX: was "Other".into() — Option<String>
             new_category: "Music".into(),
             old_tags: vec![],
             new_tags: vec!["pop".into()],
@@ -332,7 +332,7 @@ mod tests {
 
         db.save_correction(&UserCorrection {
             screenshot_id: "ss-2".into(),
-            old_category: "Other".into(),
+            old_category: Some("Other".into()),   // FIX: was "Other".into()
             new_category: "Music".into(),
             old_tags: vec![],
             new_tags: vec![],
@@ -358,7 +358,7 @@ mod tests {
         db.insert_screenshot(&ss3).unwrap();
         db.save_correction(&UserCorrection {
             screenshot_id: "ss-3".into(),
-            old_category: "Other".into(),
+            old_category: Some("Other".into()),   // FIX: was "Other".into()
             new_category: "Gaming".into(),
             old_tags: vec![],
             new_tags: vec![],
@@ -369,7 +369,6 @@ mod tests {
         assert_eq!(majority, "Music", "Çoğunluk oyu Music olmalı (2>1)");
 
         // 7) Tag öğrenmesi: min_samples=2 olan tag'ler dönmeli
-        // ss-1 ve ss-2 için "pop" tag'i var, ss-3 için yok → "pop" eşiği geçmeli
         let learned_tags = db.get_learned_tags_for_source("Spotify", 2).unwrap();
         assert!(learned_tags.contains(&"pop".to_string()), "pop tag'i en az 2 kez geçiyor, öğrenilmeli");
 

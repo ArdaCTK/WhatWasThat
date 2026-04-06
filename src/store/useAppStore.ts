@@ -12,6 +12,8 @@ export interface ToastItem {
   message: string;
   type: 'info' | 'success' | 'warning' | 'error';
   undoId?: string;
+  /** 'delete' uses undoDelete, 'archive' uses undoArchive */
+  undoAction?: 'delete' | 'archive';
 }
 
 interface AppStore {
@@ -33,6 +35,8 @@ interface AppStore {
   selectMode: boolean;
   toasts: ToastItem[];
   canUndo: boolean;
+  /** Last archived screenshot kept in memory for undo */
+  lastArchived: Screenshot | null;
 
   setView: (v: AppView) => void;
   setViewMode: (v: ViewMode) => void;
@@ -56,6 +60,7 @@ interface AppStore {
   deleteScreenshotWithUndo: (id: string) => Promise<void>;
   undoDelete: () => Promise<void>;
   archiveScreenshot: (id: string) => Promise<void>;
+  undoArchive: () => Promise<void>;
   unarchiveScreenshot: (id: string) => Promise<void>;
   toggleFavorite: (id: string) => Promise<void>;
   updateScreenshot: (s: Screenshot) => Promise<void>;
@@ -66,7 +71,7 @@ interface AppStore {
   reprocessAll: () => Promise<number>;
   checkTesseract: () => Promise<void>;
   importImages: (paths: string[]) => Promise<Screenshot[]>;
-  addToast: (msg: string, type?: ToastItem['type'], undoId?: string) => void;
+  addToast: (msg: string, type?: ToastItem['type'], undoId?: string, undoAction?: ToastItem['undoAction']) => void;
   removeToast: (id: string) => void;
   initEventListeners: () => void;
   initNotifications: () => Promise<void>;
@@ -102,6 +107,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   filters: defaultFilters, isLoading: false, processingIds: new Set(),
   sidebarOpen: true, filterPanelOpen: false, tesseractAvailable: false,
   selectedIds: new Set(), selectMode: false, toasts: [], canUndo: false,
+  lastArchived: null,
 
   setView: (view) => set({ view }),
   setViewMode: (viewMode) => set({ viewMode }),
@@ -135,9 +141,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({ selectedIds: ids, selectMode: ids.size > 0 });
   },
 
-  addToast: (message, type = 'info', undoId) => {
+  addToast: (message, type = 'info', undoId, undoAction) => {
     const id = `t${++toastN}`;
-    set((s) => ({ toasts: [...s.toasts, { id, message, type, undoId }] }));
+    set((s) => ({ toasts: [...s.toasts, { id, message, type, undoId, undoAction }] }));
     setTimeout(() => get().removeToast(id), undoId ? 8000 : 5000);
   },
 
@@ -200,8 +206,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set((s) => ({ screenshots: s.screenshots.filter((ss) => ss.id !== id), selectedId: s.selectedId === id ? null : s.selectedId, canUndo: true }));
     get().loadCategories();
     get().loadStats();
-    const T = get().settings?.ui_language;
-    get().addToast(`"${title ?? 'Record'}" ${T === 'tr' ? 'silindi' : 'deleted'}`, 'warning', id);
+    const lang = get().settings?.ui_language ?? 'en';
+    get().addToast(`"${title ?? 'Record'}" ${lang === 'tr' ? 'silindi' : 'deleted'}`, 'warning', id, 'delete');
   },
 
   undoDelete: async () => {
@@ -210,8 +216,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
       set((s) => ({ screenshots: [restored, ...s.screenshots] }));
       get().loadCategories();
       get().loadStats();
-      const T = get().settings?.ui_language;
-      get().addToast(`"${restored.title ?? 'Record'}" ${T === 'tr' ? 'geri alındı' : 'restored'}`, 'success');
+      const lang = get().settings?.ui_language ?? 'en';
+      get().addToast(`"${restored.title ?? 'Record'}" ${lang === 'tr' ? 'geri alındı' : 'restored'}`, 'success');
     }
     const more = await invoke<string | null>('peek_undo');
     set({ canUndo: !!more });
@@ -221,19 +227,54 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const ss = get().screenshots.find((s) => s.id === id);
     if (!ss) return;
     await invoke('update_screenshot', { screenshot: { ...ss, is_archived: true } });
-    set((s) => ({ screenshots: s.screenshots.filter((x) => x.id !== id) }));
+    // Keep a copy in memory for potential undo
+    set((s) => ({
+      screenshots: s.screenshots.filter((x) => x.id !== id),
+      selectedId: s.selectedId === id ? null : s.selectedId,
+      lastArchived: ss,
+    }));
     get().loadStats();
-    get().addToast('Archived', 'info');
+    const lang = get().settings?.ui_language ?? 'en';
+    get().addToast(
+      lang === 'tr' ? 'Arşivlendi' : 'Archived',
+      'info',
+      id,
+      'archive',
+    );
   },
 
-  unarchiveScreenshot: async (id) => {
-    const ss = get().screenshots.find((s) => s.id === id);
+  undoArchive: async () => {
+    const ss = get().lastArchived;
     if (!ss) return;
     const updated = { ...ss, is_archived: false };
     await invoke('update_screenshot', { screenshot: updated });
-    set((s) => ({ screenshots: s.screenshots.map((x) => x.id === id ? updated : x) }));
+    set((s) => ({
+      screenshots: [updated, ...s.screenshots],
+      lastArchived: null,
+    }));
     get().loadStats();
-    get().addToast('Removed from archive', 'success');
+    const lang = get().settings?.ui_language ?? 'en';
+    get().addToast(
+      `"${ss.title ?? 'Record'}" ${lang === 'tr' ? 'arşivden çıkarıldı' : 'removed from archive'}`,
+      'success',
+    );
+  },
+
+  unarchiveScreenshot: async (id) => {
+    // Try in current list first, fall back to lastArchived buffer
+    let ss = get().screenshots.find((s) => s.id === id) ?? get().lastArchived ?? null;
+    if (!ss) return;
+    const updated = { ...ss, is_archived: false };
+    await invoke('update_screenshot', { screenshot: updated });
+    set((s) => ({
+      screenshots: s.screenshots.some((x) => x.id === id)
+        ? s.screenshots.map((x) => x.id === id ? updated : x)
+        : [updated, ...s.screenshots],
+      lastArchived: s.lastArchived?.id === id ? null : s.lastArchived,
+    }));
+    get().loadStats();
+    const lang = get().settings?.ui_language ?? 'en';
+    get().addToast(lang === 'tr' ? 'Arşivden çıkarıldı' : 'Removed from archive', 'success');
   },
 
   toggleFavorite: async (id) => {
@@ -334,7 +375,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
     const results: Screenshot[] = [];
 
-    // Import .wwt archives one by one
     for (const p of wwtPaths) {
       try {
         const ss = await invoke<Screenshot>('import_wwt', { wwtPath: p });
@@ -344,7 +384,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
       }
     }
 
-    // Import image files in bulk
     if (imgPaths.length > 0) {
       const imported = await invoke<Screenshot[]>('import_images', { paths: imgPaths });
       results.push(...imported);
@@ -398,7 +437,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
       });
       get().loadCategories();
       get().loadStats();
-      // Toast for auto-processed screenshots (notification:show may not fire if show_notifications=false)
       if (payload.status === 'done' && payload.title) {
         const lang = get().settings?.ui_language ?? 'en';
         const cat = payload.category ?? '';
