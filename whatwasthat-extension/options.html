@@ -1,0 +1,78 @@
+﻿<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <title>WhatWasThat - Options</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; background: #0d1117; color: #f0f6fc; padding: 24px; min-width: 460px; }
+    h1 { font-size: 18px; margin-bottom: 4px; }
+    .subtitle { color: #484f58; font-size: 12px; margin-bottom: 24px; }
+    .section { margin-bottom: 24px; }
+    .section h2 { font-size: 13px; color: #8b949e; margin-bottom: 12px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
+    .field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; }
+    label { font-size: 13px; color: #c9d1d9; }
+    .hint { font-size: 11px; color: #484f58; line-height: 1.5; }
+    input[type="number"], input[type="text"] { padding: 7px 10px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #f0f6fc; font-size: 13px; max-width: 360px; outline: none; }
+    input:focus { border-color: #58a6ff; }
+    .toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
+    .toggle input[type="checkbox"] { accent-color: #58a6ff; width: 15px; height: 15px; cursor: pointer; }
+    .btn-row { display: flex; align-items: center; gap: 8px; }
+    .btn-save, .btn-secondary { padding: 8px 16px; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .btn-save { background: #58a6ff; color: #0d1117; }
+    .btn-secondary { background: #21262d; color: #f0f6fc; }
+    #save-msg { margin-left: 10px; font-size: 12px; color: #3fb950; display: none; }
+    .status-section { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 12px 14px; margin-bottom: 20px; }
+    .status-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: #484f58; }
+    .dot.green { background: #3fb950; }
+    .dot.red { background: #ef4444; }
+  </style>
+</head>
+<body>
+  <h1>WhatWasThat Extension</h1>
+  <p class="subtitle">Browser extension settings</p>
+
+  <div class="status-section">
+    <div class="status-row">
+      <div class="dot" id="conn-dot"></div>
+      <span id="conn-text">Checking connection...</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Connection</h2>
+    <div class="field">
+      <label>WhatWasThat Port</label>
+      <input type="number" id="wwt_port" min="1024" max="65535" value="27484" />
+    </div>
+    <div class="field">
+      <label>API Token (required)</label>
+      <input type="text" id="api_token" placeholder="Paste token from app settings" />
+      <span class="hint">Desktop app -> Settings -> Security -> Local API Protection -> API Token</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Behavior</h2>
+    <div class="field">
+      <label class="toggle">
+        <input type="checkbox" id="show_badge" />
+        <span>Show connection badge on extension icon</span>
+      </label>
+    </div>
+    <div class="field">
+      <label>Capture quality (%)</label>
+      <input type="number" id="capture_quality" min="50" max="100" value="90" />
+    </div>
+  </div>
+
+  <div class="btn-row">
+    <button class="btn-save" id="btn-save">Save</button>
+    <button class="btn-secondary" id="btn-test">Test Connection</button>
+    <span id="save-msg">Saved</span>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,41 @@
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Rust
+target/
+
+# Tauri
+src-tauri/target/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS
+.DS_Store
+Thumbs.db
+
+# App data
+*.db
+*.db-shm
+*.db-wal
+
+# Ignore Gradle project-specific cache directory
+.gradle
+
+# Ignore Gradle build output directory
+build
