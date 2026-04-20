@@ -1,10 +1,14 @@
-﻿const $ = (id) => document.getElementById(id);
+const $ = (id) => document.getElementById(id);
 
-const DEFAULTS = {
+// FIX: mirror background.js storage split — non-sensitive settings in sync,
+// api_token in local storage only.
+const SYNC_DEFAULTS = {
   wwt_port: 27484,
   show_badge: true,
   capture_quality: 90,
-  api_token: ''
+};
+const LOCAL_DEFAULTS = {
+  api_token: '',
 };
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -21,28 +25,35 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 async function loadSettings() {
-  const s = await chrome.storage.sync.get(DEFAULTS);
-  $('wwt_port').value = s.wwt_port;
-  $('show_badge').checked = s.show_badge;
-  $('capture_quality').value = s.capture_quality;
-  $('api_token').value = s.api_token || '';
+  const [syncPart, localPart] = await Promise.all([
+    chrome.storage.sync.get(SYNC_DEFAULTS),
+    chrome.storage.local.get(LOCAL_DEFAULTS),
+  ]);
+  $('wwt_port').value = syncPart.wwt_port;
+  $('show_badge').checked = syncPart.show_badge;
+  $('capture_quality').value = syncPart.capture_quality;
+  $('api_token').value = localPart.api_token || '';
 }
 
 async function saveSettings() {
-  const settings = {
-    wwt_port: parseInt($('wwt_port').value, 10) || DEFAULTS.wwt_port,
+  const api_token = ($('api_token').value || '').trim();
+  const syncable = {
+    wwt_port: parseInt($('wwt_port').value, 10) || SYNC_DEFAULTS.wwt_port,
     show_badge: $('show_badge').checked,
-    capture_quality: parseInt($('capture_quality').value, 10) || DEFAULTS.capture_quality,
-    api_token: ($('api_token').value || '').trim()
+    capture_quality: parseInt($('capture_quality').value, 10) || SYNC_DEFAULTS.capture_quality,
   };
-  await chrome.storage.sync.set(settings);
-  chrome.runtime.sendMessage({ type: 'SAVE_SETTINGS', settings });
+  await Promise.all([
+    chrome.storage.sync.set(syncable),
+    chrome.storage.local.set({ api_token }),
+  ]);
+  // Notify background script so its cached settings are refreshed
+  chrome.runtime.sendMessage({ type: 'SAVE_SETTINGS', settings: { ...syncable, api_token } });
 }
 
 async function checkConnection() {
   const dot = $('conn-dot');
   const text = $('conn-text');
-  const port = parseInt($('wwt_port').value, 10) || DEFAULTS.wwt_port;
+  const port = parseInt($('wwt_port').value, 10) || SYNC_DEFAULTS.wwt_port;
   const token = ($('api_token').value || '').trim();
 
   try {

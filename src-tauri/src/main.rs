@@ -31,10 +31,8 @@ use tauri::{CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-/// Port used for single-instance IPC (prevent multiple app windows)
 const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:27485";
 
-/// Collects .wwt file paths passed as command-line arguments.
 fn collect_wwt_args() -> Vec<String> {
     std::env::args_os().skip(1).filter_map(|a: OsString| {
         let s = a.to_string_lossy().to_string();
@@ -46,7 +44,6 @@ fn collect_wwt_args() -> Vec<String> {
     }).collect()
 }
 
-/// Attempts to forward a command to an already-running instance via local TCP.
 fn forward_to_running_instance(paths: &[String]) -> bool {
     let mut stream = match TcpStream::connect(SINGLE_INSTANCE_ADDR) { Ok(s) => s, Err(_) => return false };
     let payload = if paths.is_empty() { "SHOW\n".to_string() } else { format!("{}\n", paths.join("\n")) };
@@ -80,9 +77,30 @@ fn import_wwt_into_db(db: &Arc<Database>, images_dir: &PathBuf, wwt_path: &str) 
     Ok(ss)
 }
 
+// FIX: validate IPC commands — only accept "SHOW" or existing .wwt file paths.
+// Prevents arbitrary file import from any local process that can connect to port 27485.
+fn is_valid_ipc_command(cmd: &str) -> bool {
+    let text = cmd.trim();
+    if text.is_empty() { return false; }
+    if text.eq_ignore_ascii_case("SHOW") { return true; }
+    let path = Path::new(text);
+    let ext = path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    ext == "wwt" && path.exists()
+}
+
 fn process_external_command(cmd: &str, db: &Arc<Database>, images_dir: &PathBuf, app_handle: &tauri::AppHandle) {
     let text = cmd.trim();
     if text.is_empty() { return; }
+
+    // FIX: reject commands that are not "SHOW" or a valid existing .wwt path
+    if !is_valid_ipc_command(text) {
+        log::warn!("IPC: rejected invalid/unsafe command: {:?}", text);
+        return;
+    }
+
     if text.eq_ignore_ascii_case("SHOW") {
         if let Some(w) = app_handle.get_window("main") { let _ = w.show(); let _ = w.set_focus(); }
         return;
@@ -149,7 +167,6 @@ fn main() {
                 archive_cancel: Arc::new(AtomicBool::new(false)),
             })));
 
-            // Apply saved language to tray menu labels
             {
                 let s = db.load_settings();
                 let en = s.ui_language.trim().eq_ignore_ascii_case("en");
@@ -165,7 +182,6 @@ fn main() {
             #[cfg(target_os = "windows")]
             register_wwt_file_association_windows();
 
-            // Single-instance IPC listener (receives .wwt paths and SHOW commands)
             {
                 let listener = single_instance_listener.try_clone().ok();
                 let db_ipc = db.clone();
@@ -188,7 +204,6 @@ fn main() {
                 }
             }
 
-            // Warm the thumbnail cache in a background thread
             {
                 let db_warm = db.clone();
                 let cache = cache::get_cache();
@@ -203,23 +218,23 @@ fn main() {
             let db_for_clipboard = db.clone();
             let db_for_api = db.clone();
 
+            // FIX: replaced per-event tokio::runtime::Runtime::new() with tauri::async_runtime::spawn.
+            // The old code created a brand-new Tokio runtime on every clipboard poll (every 800ms),
+            // causing thread and memory growth over time.
             clipboard::start_monitoring(poll_ms, move |capture| {
                 let db_ref = db_for_clipboard.clone();
                 let images_dir_ref = images_dir_c.clone();
                 let app_ref = app_handle.clone();
-                let rt = tokio::runtime::Runtime::new().unwrap();
 
-                rt.block_on(async move {
+                tauri::async_runtime::spawn(async move {
                     let settings = db_ref.load_settings();
 
-                    // Skip if the active app is in the exclusion list (clipboard source only)
                     if capture.source == clipboard::CaptureSource::Clipboard {
                         if let Some(ref app_name) = capture.app_name {
                             if app_info::is_app_excluded(app_name, &settings.excluded_apps) { return; }
                         }
                     }
 
-                    // Deduplication check via pHash
                     if settings.dedup_enabled {
                         if let Some(h) = phash::compute_phash_from_bytes(&capture.bytes, capture.width, capture.height) {
                             let hex = phash::hash_to_hex(h);
@@ -273,7 +288,6 @@ fn main() {
                     app_ref.emit_all("screenshot:new", &ss).unwrap_or_default();
                     if !settings.auto_process { return; }
 
-                    // OCR — run with user-configured language, then re-run if a better language is detected
                     let initial = ocr::run_ocr(&img_path, &settings.ocr_language).unwrap_or_default();
                     let lang = ocr::detect_language(&initial);
                     let best_lang = ocr::best_tesseract_lang(&lang, &settings.ocr_language);
@@ -325,7 +339,6 @@ fn main() {
                 });
             });
 
-            // Start local API server for browser extension
             {
                 let db_api = db_for_api;
                 let dir_api = images_dir.clone();
@@ -335,7 +348,6 @@ fn main() {
                 });
             }
 
-            // Process any .wwt files opened at startup
             for f in &startup_wwt_files {
                 process_external_command(f, &db, &images_dir, &app.handle());
             }

@@ -1,6 +1,4 @@
 use arboard::Clipboard;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 pub struct ClipboardMonitor { last_hash: Option<u64> }
@@ -43,21 +41,43 @@ impl ClipboardMonitor {
     }
 }
 
+// FIX: replaced std::collections::hash_map::DefaultHasher with FNV-1a.
+// DefaultHasher's output is explicitly not stable across Rust versions
+// (per the stdlib docs). If this hash is ever persisted or compared across
+// process restarts it could silently mismatch.
+// FNV-1a is deterministic, platform-independent, and ~same speed for small inputs.
 fn fast_hash(data: &[u8]) -> u64 {
-    let mut h = DefaultHasher::new();
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+
     let sample = 4096usize;
-    if data.len() > sample * 2 {
-        data[..sample].hash(&mut h);
-        data[data.len() - sample..].hash(&mut h);
-        data.len().hash(&mut h);
-    } else {
-        data.hash(&mut h);
+    let mut hasher = FNV_OFFSET;
+
+    // Sample leading bytes
+    let end = data.len().min(sample);
+    for &b in &data[..end] {
+        hasher ^= b as u64;
+        hasher = hasher.wrapping_mul(FNV_PRIME);
     }
-    h.finish()
+
+    // Sample trailing bytes (if image is large enough to skip the middle)
+    if data.len() > sample * 2 {
+        let start = data.len() - sample;
+        for &b in &data[start..] {
+            hasher ^= b as u64;
+            hasher = hasher.wrapping_mul(FNV_PRIME);
+        }
+        // Mix in total length so two different-sized images with same leading/trailing
+        // bytes don't collide
+        for &b in &(data.len() as u64).to_ne_bytes() {
+            hasher ^= b as u64;
+            hasher = hasher.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    hasher
 }
 
-/// Returns the Windows Screenshots folder path:
-/// `%USERPROFILE%\Pictures\Screenshots`
 #[cfg(target_os = "windows")]
 fn windows_screenshots_folder() -> Option<std::path::PathBuf> {
     let profile = std::env::var("USERPROFILE").ok()?;
@@ -65,8 +85,6 @@ fn windows_screenshots_folder() -> Option<std::path::PathBuf> {
     if path.exists() { Some(path) } else { None }
 }
 
-/// Watches the Windows Screenshots folder for new image files created recently.
-/// Returns a list of new file paths added since the last check.
 #[cfg(target_os = "windows")]
 fn poll_screenshots_folder(known: &mut std::collections::HashSet<String>) -> Vec<std::path::PathBuf> {
     let Some(folder) = windows_screenshots_folder() else { return vec![]; };
@@ -85,22 +103,18 @@ fn poll_screenshots_folder(known: &mut std::collections::HashSet<String>) -> Vec
         let key = path.to_string_lossy().to_string();
         if known.contains(&key) { continue; }
 
-        // Only pick up files modified within the last 10 seconds
         let Ok(meta) = std::fs::metadata(&path) else { continue; };
         let Ok(modified) = meta.modified() else { continue; };
         if modified >= cutoff {
             known.insert(key);
             new_files.push(path);
         } else {
-            // Still register so we don't re-check it
             known.insert(key);
         }
     }
     new_files
 }
 
-/// Starts clipboard monitoring and (on Windows) Screenshots folder monitoring.
-/// Calls `callback` for each new capture detected.
 pub fn start_monitoring<F>(interval_ms: u64, mut callback: F)
 where
     F: FnMut(ImageCapture) + Send + 'static,
@@ -111,7 +125,6 @@ where
 
         #[cfg(target_os = "windows")]
         let mut known_files: std::collections::HashSet<String> = {
-            // Pre-populate with existing files so we don't import old screenshots on startup
             let mut set = std::collections::HashSet::new();
             if let Some(folder) = windows_screenshots_folder() {
                 if let Ok(entries) = std::fs::read_dir(&folder) {
@@ -124,12 +137,10 @@ where
         };
 
         loop {
-            // Clipboard-based capture (Win+Shift+S)
             if let Some(capture) = monitor.poll() {
                 callback(capture);
             }
 
-            // Windows PrintScreen folder watcher
             #[cfg(target_os = "windows")]
             {
                 for path in poll_screenshots_folder(&mut known_files) {

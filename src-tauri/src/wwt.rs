@@ -5,6 +5,9 @@ use std::path::Path;
 use base64::Engine;
 
 const WWT_VERSION: u32 = 1;
+// FIX: maximum allowed size per ZIP entry to prevent ZIP bomb / OOM attacks.
+// A crafted .wwt file could declare a tiny compressed size but decompress to GBs.
+const MAX_ENTRY_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WwtMeta {
@@ -60,14 +63,36 @@ pub fn export_wwt(ss: &Screenshot, out_path: &Path) -> Result<(), String> {
 pub fn import_wwt(wwt_path: &Path) -> Result<(WwtMeta, Vec<u8>, Option<String>), String> {
     let file = std::fs::File::open(wwt_path).map_err(|e| format!("Open failed: {}", e))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("ZIP open failed: {}", e))?;
-    let mut meta_json = String::new(); let mut image_data = Vec::new(); let mut ocr_text = None;
+    let mut meta_json = String::new();
+    let mut image_data = Vec::new();
+    let mut ocr_text = None;
+
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| format!("ZIP read: {}", e))?;
         let name = entry.name().to_string();
-        if name == "meta.json" { entry.read_to_string(&mut meta_json).map_err(|e| format!("meta.json: {}", e))?; }
-        else if name.starts_with("image.") { entry.read_to_end(&mut image_data).map_err(|e| format!("image: {}", e))?; }
-        else if name == "ocr.txt" { let mut s = String::new(); entry.read_to_string(&mut s).map_err(|e| format!("ocr.txt: {}", e))?; ocr_text = Some(s); }
+
+        // FIX: reject oversized entries before reading them into memory.
+        // entry.size() is the uncompressed size declared in the ZIP header.
+        // A ZIP bomb sets a tiny compressed payload but claims a huge uncompressed size.
+        if entry.size() > MAX_ENTRY_BYTES {
+            return Err(format!(
+                "Entry '{}' exceeds maximum allowed size ({} MB)",
+                name,
+                MAX_ENTRY_BYTES / 1024 / 1024
+            ));
+        }
+
+        if name == "meta.json" {
+            entry.read_to_string(&mut meta_json).map_err(|e| format!("meta.json read: {}", e))?;
+        } else if name.starts_with("image.") {
+            entry.read_to_end(&mut image_data).map_err(|e| format!("image read: {}", e))?;
+        } else if name == "ocr.txt" {
+            let mut s = String::new();
+            entry.read_to_string(&mut s).map_err(|e| format!("ocr.txt read: {}", e))?;
+            ocr_text = Some(s);
+        }
     }
+
     if meta_json.is_empty() { return Err("meta.json not found".into()); }
     if image_data.is_empty() { return Err("image not found".into()); }
     let meta: WwtMeta = serde_json::from_str(&meta_json).map_err(|e| format!("meta.json parse: {}", e))?;

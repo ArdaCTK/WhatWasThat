@@ -3,55 +3,59 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensitiveMatch { pub kind: String, pub start: usize, pub end: usize, pub masked: String }
 
-/// FIX: actually detect sensitive patterns and return match positions.
-/// Previously this always returned vec![] — now it walks line-by-line,
-/// detects each kind, and returns the byte range + masked replacement.
+// FIX: offset tracking now uses char count, not byte length.
+// Turkish characters (ş, ğ, ı, ö, ü, ç) are 2 bytes each in UTF-8.
+// The old `line.len()` returned bytes, producing wrong start/end positions in
+// SensitiveMatch that could cause panics or incorrect frontend highlighting.
 pub fn detect_sensitive(text: &str) -> Vec<SensitiveMatch> {
     let mut matches = Vec::new();
-    let mut offset = 0usize;
+    let mut char_offset = 0usize;
 
     for line in text.lines() {
+        let line_char_len = line.chars().count();
+
         if has_credit_card(line) {
             matches.push(SensitiveMatch {
                 kind: "credit_card".to_string(),
-                start: offset,
-                end: offset + line.len(),
+                start: char_offset,
+                end: char_offset + line_char_len,
                 masked: mask_credit_cards_in(line),
             });
         }
         if has_iban(line) {
             matches.push(SensitiveMatch {
                 kind: "iban".to_string(),
-                start: offset,
-                end: offset + line.len(),
+                start: char_offset,
+                end: char_offset + line_char_len,
                 masked: mask_iban_in(line),
             });
         }
         if has_api_key(line) {
             matches.push(SensitiveMatch {
                 kind: "api_key".to_string(),
-                start: offset,
-                end: offset + line.len(),
+                start: char_offset,
+                end: char_offset + line_char_len,
                 masked: mask_api_keys_in(line),
             });
         }
         if has_password(line) {
             matches.push(SensitiveMatch {
                 kind: "password".to_string(),
-                start: offset,
-                end: offset + line.len(),
+                start: char_offset,
+                end: char_offset + line_char_len,
                 masked: mask_passwords_in(line),
             });
         }
         if has_tc_no(line) {
             matches.push(SensitiveMatch {
                 kind: "tc_id".to_string(),
-                start: offset,
-                end: offset + line.len(),
+                start: char_offset,
+                end: char_offset + line_char_len,
                 masked: mask_tc_in(line),
             });
         }
-        offset += line.len() + 1; // +1 for the newline character
+        // +1 for the newline character (always single char)
+        char_offset += line_char_len + 1;
     }
 
     matches

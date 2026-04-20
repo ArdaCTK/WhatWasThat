@@ -51,7 +51,7 @@
       "longDescription": "Automatically categorize and search your screenshots using OCR and AI"
     },
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' https://api.openai.com https://fonts.googleapis.com http://localhost:* http://127.0.0.1:*; script-src 'self'"
     },
     "systemTray": {
       "iconPath": "icons/icon.ico",

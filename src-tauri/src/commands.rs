@@ -27,9 +27,7 @@ fn find_windows_release_binary(current_exe: &Path) -> Option<PathBuf> {
         if let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) {
             if name.eq_ignore_ascii_case("debug") {
                 let candidate = ancestor.parent()?.join("release").join(file_name);
-                if candidate.exists() {
-                    return Some(candidate);
-                }
+                if candidate.exists() { return Some(candidate); }
             }
         }
     }
@@ -58,11 +56,8 @@ pub(crate) fn set_windows_startup(enable: bool) -> Result<(), String> {
         .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_SET_VALUE)
         .map_err(|e| e.to_string())?;
     if enable {
-        run_key
-            .set_value("WhatWasThat", &resolve_windows_startup_command()?)
-            .map_err(|e| e.to_string())?;
+        run_key.set_value("WhatWasThat", &resolve_windows_startup_command()?).map_err(|e| e.to_string())?;
     } else {
-        // Ignore error if key doesn't exist
         let _ = run_key.delete_value("WhatWasThat");
     }
     Ok(())
@@ -169,16 +164,37 @@ pub async fn cancel_screenshot_processing(state: State<'_, Db>, id: String) -> R
     Ok(ss)
 }
 
+// FIX: bulk_reprocess now respects queue_concurrency setting.
+// Previously ran all screenshots sequentially with a plain for loop.
+// Now spawns concurrent tasks limited by a semaphore — same concurrency control
+// used by the main processing queue.
 #[tauri::command]
 pub async fn bulk_reprocess(state: State<'_, Db>, ids: Vec<String>) -> Result<BulkReprocessResult, String> {
     let (settings, db) = { let s = state.lock().await; (s.db.load_settings(), s.db.clone()) };
     let screenshots = db.get_screenshots_by_ids(&ids).map_err(|e| e.to_string())?;
     let count = screenshots.len() as u32;
     let queued_ids: Vec<String> = screenshots.iter().map(|s| s.id.clone()).collect();
+
+    let concurrency = settings.queue_concurrency.max(1);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut handles = Vec::with_capacity(screenshots.len());
+
     for ss in screenshots {
-        let updated = process_one(ss, &settings, &db).await;
-        if let Some(ref t) = updated.image_thumb { get_cache().set(&updated.id, t.clone()); }
+        let settings = settings.clone();
+        let db = db.clone();
+        let sem = semaphore.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let updated = process_one(ss, &settings, &db).await;
+            if let Some(ref t) = updated.image_thumb { get_cache().set(&updated.id, t.clone()); }
+            updated
+        }));
     }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
     Ok(BulkReprocessResult { queued: count, ids: queued_ids })
 }
 
@@ -379,20 +395,23 @@ pub async fn lock_archive(state: State<'_, Db>, app: tauri::AppHandle, password:
         let s = state.lock().await;
         (s.images_dir.clone(), s.db.clone(), s.archive_cancel.clone())
     };
-    cancel_flag.store(false, Ordering::SeqCst);
+    // FIX: Relaxed ordering is sufficient for a simple boolean cancel flag.
+    // SeqCst (sequentially consistent) adds a full memory barrier — unnecessary here
+    // since we only need the flag value itself, not ordering relative to other memory ops.
+    cancel_flag.store(false, Ordering::Relaxed);
     let files = crypto::list_encryptable_images(&images_dir).map_err(|e| e.to_string())?;
     let total = files.len();
     let mut done = 0usize;
     for chunk in files.chunks(32) {
         let mut jobs = Vec::with_capacity(chunk.len());
         for path in chunk {
-            if cancel_flag.load(Ordering::SeqCst) {
+            if cancel_flag.load(Ordering::Relaxed) {
                 app.emit_all("archive:cancelled", serde_json::json!({"done": done, "total": total})).ok();
                 return Err("Archive encryption cancelled".into());
             }
             let p = path.clone(); let pw = password.clone(); let cancel = cancel_flag.clone();
             jobs.push(tokio::task::spawn_blocking(move || {
-                if cancel.load(Ordering::SeqCst) { return Ok(false); }
+                if cancel.load(Ordering::Relaxed) { return Ok(false); }
                 crypto::encrypt_file(&p, &pw).map(|_| true)
             }));
         }
@@ -419,17 +438,17 @@ pub async fn unlock_archive(state: State<'_, Db>, app: tauri::AppHandle, passwor
     if !settings.archive_password_hash.is_empty() && !crypto::verify_password(&password, &settings.archive_password_hash) {
         return Err("Incorrect password".into());
     }
-    cancel_flag.store(false, Ordering::SeqCst);
+    cancel_flag.store(false, Ordering::Relaxed);
     let files = crypto::list_decryptable_images(&images_dir).map_err(|e| e.to_string())?;
     let total = files.len();
     let mut done = 0usize;
     for chunk in files.chunks(32) {
         let mut jobs = Vec::with_capacity(chunk.len());
         for path in chunk {
-            if cancel_flag.load(Ordering::SeqCst) { return Err("Archive decryption cancelled".into()); }
+            if cancel_flag.load(Ordering::Relaxed) { return Err("Archive decryption cancelled".into()); }
             let p = path.clone(); let pw = password.clone(); let cancel = cancel_flag.clone();
             jobs.push(tokio::task::spawn_blocking(move || {
-                if cancel.load(Ordering::SeqCst) { return Ok(false); }
+                if cancel.load(Ordering::Relaxed) { return Ok(false); }
                 crypto::decrypt_file(&p, &pw).map(|_| true)
             }));
         }
@@ -465,7 +484,7 @@ pub async fn verify_archive_password(state: State<'_, Db>, password: String) -> 
 
 #[tauri::command]
 pub async fn cancel_archive_operation(state: State<'_, Db>) -> Result<(), String> {
-    state.lock().await.archive_cancel.store(true, Ordering::SeqCst);
+    state.lock().await.archive_cancel.store(true, Ordering::Relaxed);
     Ok(())
 }
 
@@ -588,8 +607,6 @@ pub async fn import_wwt(state: State<'_, Db>, wwt_path: String) -> Result<Screen
     Ok(ss)
 }
 
-/// Imports one or more existing image files into the archive and queues them for OCR + AI processing.
-/// Returns the list of newly created Screenshot records.
 #[tauri::command]
 pub async fn import_images(
     state: State<'_, Db>,
@@ -618,7 +635,6 @@ pub async fn import_images(
         let dest_filename = format!("{}_{}_imported.png", now.format("%Y%m%d_%H%M%S_%3f"), &id[..8]);
         let dest_path = images_dir.join(&dest_filename);
 
-        // Convert to PNG on import for uniform storage
         match image::open(src_path) {
             Ok(img) => {
                 if let Err(e) = img.save(&dest_path) {
@@ -635,7 +651,6 @@ pub async fn import_images(
         let thumb = crate::ocr::generate_thumbnail(&dest_path);
         let phash_val = crate::phash::compute_phash(&dest_path).map(|h| crate::phash::hash_to_hex(h));
 
-        // Skip duplicates if dedup is enabled
         if settings.dedup_enabled {
             if let Some(ref ph) = phash_val {
                 if let Ok(similar) = db.find_similar_phash(ph, settings.dedup_threshold) {
@@ -666,7 +681,6 @@ pub async fn import_images(
         if let Some(ref t) = thumb { get_cache().set(&id, t.clone()); }
         app.emit_all("screenshot:new", &ss).unwrap_or_default();
 
-        // Queue for OCR + AI processing
         if settings.auto_process {
             let db_q = db.clone();
             let settings_q = settings.clone();
@@ -700,8 +714,6 @@ pub async fn open_exports_folder(state: State<'_, Db>) -> Result<(), String> {
     Ok(())
 }
 
-/// Opens a native OS file-picker dialog and returns the selected image paths.
-/// Uses Tauri's built-in blocking dialog API — no tauri.allowlist entry required.
 #[tauri::command]
 pub async fn pick_files() -> Result<Vec<String>, String> {
     let paths = tauri::async_runtime::spawn_blocking(|| {

@@ -2,24 +2,37 @@ use crate::models::*;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, Result};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-pub struct Database { pub path: PathBuf }
+// FIX: store a single persistent Connection behind a Mutex instead of opening
+// a new connection for every query. The old approach re-ran PRAGMA journal_mode=WAL
+// and opened/closed an OS file handle on every Tauri command invocation.
+// rusqlite::Connection is Send but not Sync; Mutex<Connection> makes it Sync.
+pub struct Database {
+    pub path: PathBuf,
+    inner: Mutex<Connection>,
+}
 
 impl Database {
     pub fn new(app_dir: &PathBuf) -> Result<Self> {
-        let db = Self { path: app_dir.join("whatwasthat.db") };
+        let path = app_dir.join("whatwasthat.db");
+        let conn = Connection::open(&path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        let db = Self { path, inner: Mutex::new(conn) };
         db.migrate()?;
         Ok(db)
     }
 
-    fn connect(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        Ok(conn)
+    // Returns a MutexGuard that derefs to &Connection.  If the mutex is poisoned
+    // (only happens after a panic inside a lock scope) we recover the inner value
+    // rather than propagating the poison — a single query panic should not kill
+    // all future DB access.
+    fn conn(&self) -> std::sync::MutexGuard<Connection> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn migrate(&self) -> Result<()> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS screenshots (
                 id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, image_path TEXT NOT NULL,
@@ -51,7 +64,6 @@ impl Database {
             );
         ")?;
 
-        // Add columns introduced in later migrations (safe to ignore if already present)
         for (col, def) in &[
             ("app_info","TEXT"),("confidence","REAL"),("detected_language","TEXT"),
             ("is_favorite","INTEGER NOT NULL DEFAULT 0"),
@@ -101,7 +113,6 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_screenshot_tags_screenshot_id ON screenshot_tags(screenshot_id);
         ");
 
-        // Backfill tag index for pre-existing rows
         let _ = conn.execute_batch("
             INSERT OR IGNORE INTO screenshot_tags(screenshot_id,tag)
             SELECT id, LOWER(TRIM(value)) FROM screenshots, json_each(screenshots.tags)
@@ -112,7 +123,7 @@ impl Database {
     }
 
     pub fn insert_screenshot(&self, s: &Screenshot) -> Result<()> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         let tags = serde_json::to_string(&s.tags).unwrap_or_default();
         conn.execute(
             "INSERT INTO screenshots (id,timestamp,image_path,image_thumb,ocr_text,ocr_masked,
@@ -128,7 +139,7 @@ impl Database {
     }
 
     pub fn update_screenshot(&self, s: &Screenshot) -> Result<()> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         let tags = serde_json::to_string(&s.tags).unwrap_or_default();
         conn.execute(
             "UPDATE screenshots SET ocr_text=?1,ocr_masked=?2,has_sensitive=?3,title=?4,
@@ -144,14 +155,14 @@ impl Database {
     }
 
     pub fn get_screenshot(&self, id: &str) -> Result<Option<Screenshot>> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         let mut stmt = conn.prepare(SEL_ALL_COLS)?;
         let result: Vec<Screenshot> = stmt.query_map(params![id], row_to_ss)?.collect::<Result<Vec<_>>>()?;
         Ok(result.into_iter().next())
     }
 
     pub fn search_screenshots(&self, q: &SearchQuery) -> Result<Vec<Screenshot>> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         let mut params_v: Vec<Value> = Vec::new();
         let mut where_parts: Vec<String> = Vec::new();
         let text_query = q.query.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty());
@@ -191,10 +202,6 @@ impl Database {
             where_parts.push(format!("{p}status = 'error'"));
         }
 
-        // Archive visibility logic:
-        //   only_archived=true  → show ONLY archived rows
-        //   include_archived=true → show all rows (archived + non-archived)
-        //   default             → hide archived rows
         if q.only_archived {
             where_parts.push(format!("{p}is_archived = 1"));
         } else if !q.include_archived {
@@ -247,7 +254,7 @@ impl Database {
     }
 
     pub fn find_similar_phash(&self, phash_hex: &str, threshold_bits: u32) -> Result<Vec<(String, String, u32)>> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         let target = u64::from_str_radix(phash_hex, 16).unwrap_or(0);
         let mut stmt = conn.prepare("SELECT id, phash FROM screenshots WHERE phash IS NOT NULL")?;
         let rows = stmt
@@ -265,13 +272,13 @@ impl Database {
     }
 
     pub fn delete_screenshot(&self, id: &str) -> Result<()> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         conn.execute("DELETE FROM screenshots WHERE id=?1", params![id])?;
         Ok(())
     }
 
     pub fn get_categories(&self) -> Result<Vec<Category>> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT category, COUNT(*) FROM screenshots
              WHERE category IS NOT NULL AND is_archived=0
@@ -289,7 +296,7 @@ impl Database {
     }
 
     pub fn get_stats(&self) -> Result<Stats> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM screenshots WHERE is_archived=0", [], |r| r.get(0)).unwrap_or(0);
         let pending: i64 = conn.query_row(
@@ -350,7 +357,7 @@ impl Database {
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         match conn.query_row("SELECT value FROM settings WHERE key=?1", params![key], |r| r.get(0)) {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -359,13 +366,13 @@ impl Database {
     }
 
     pub fn set_setting(&self, key: &str, val: &str) -> Result<()> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         conn.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?1,?2)", params![key, val])?;
         Ok(())
     }
 
     pub fn get_pending_screenshots(&self) -> Result<Vec<Screenshot>> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id,timestamp,image_path,image_thumb,ocr_text,ocr_masked,has_sensitive,
              title,description,category,tags,source_hint,app_info,confidence,detected_language,
@@ -376,7 +383,7 @@ impl Database {
 
     pub fn get_screenshots_by_ids(&self, ids: &[String]) -> Result<Vec<Screenshot>> {
         if ids.is_empty() { return Ok(vec![]); }
-        let conn = self.connect()?;
+        let conn = self.conn();
         let ph = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT id,timestamp,image_path,image_thumb,ocr_text,ocr_masked,has_sensitive,
@@ -390,7 +397,7 @@ impl Database {
     }
 
     pub fn save_correction(&self, c: &UserCorrection) -> Result<()> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO user_corrections (screenshot_id,old_category,new_category,old_tags,new_tags,corrected_at)
              VALUES (?1,?2,?3,?4,?5,?6)",
@@ -403,7 +410,7 @@ impl Database {
     }
 
     pub fn get_corrections(&self, limit: i64) -> Result<Vec<UserCorrection>> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT screenshot_id,old_category,new_category,old_tags,new_tags,corrected_at
              FROM user_corrections ORDER BY corrected_at DESC LIMIT ?1")?;
@@ -420,13 +427,13 @@ impl Database {
     }
 
     pub fn get_all_thumbnails(&self) -> Result<Vec<(String, String)>> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         let mut stmt = conn.prepare("SELECT id, image_thumb FROM screenshots WHERE image_thumb IS NOT NULL")?;
         let x = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>>>(); x
     }
 
     pub fn add_processing_log(&self, screenshot_id: Option<&str>, stage: &str, level: &str, message: &str) -> Result<()> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO processing_logs (screenshot_id,stage,level,message) VALUES (?1,?2,?3,?4)",
             params![screenshot_id, stage, level, message],
@@ -435,7 +442,7 @@ impl Database {
     }
 
     pub fn get_processing_logs(&self, limit: i64) -> Result<Vec<(String, Option<String>, String, String, String)>> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT created_at,screenshot_id,stage,level,message FROM processing_logs ORDER BY id DESC LIMIT ?1")?;
         let x = stmt.query_map(params![limit], |r| Ok((
@@ -445,7 +452,7 @@ impl Database {
     }
 
     pub fn recover_stuck_processing(&self) -> Result<usize> {
-        let conn = self.connect()?;
+        let conn = self.conn();
         Ok(conn.execute(
             "UPDATE screenshots SET status='error', error_msg='Recovered from stale processing state'
              WHERE status='processing'",
@@ -455,7 +462,7 @@ impl Database {
 
     pub fn get_learned_category_for_source(&self, source: &str) -> Result<Option<(String, i64)>> {
         if source.trim().is_empty() { return Ok(None); }
-        let conn = self.connect()?;
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT uc.new_category, COUNT(*) as c FROM user_corrections uc
              JOIN screenshots s ON s.id=uc.screenshot_id
@@ -470,7 +477,7 @@ impl Database {
 
     pub fn get_learned_tags_for_source(&self, source: &str, min_count: i64) -> Result<Vec<String>> {
         if source.trim().is_empty() { return Ok(vec![]); }
-        let conn = self.connect()?;
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT uc.new_tags FROM user_corrections uc
              JOIN screenshots s ON s.id=uc.screenshot_id
@@ -483,9 +490,7 @@ impl Database {
             if let Ok(tags) = serde_json::from_str::<Vec<String>>(&raw) {
                 for tag in tags {
                     let t = tag.trim().to_lowercase();
-                    if !t.is_empty() {
-                        *counts.entry(t).or_insert(0) += 1;
-                    }
+                    if !t.is_empty() { *counts.entry(t).or_insert(0) += 1; }
                 }
             }
         }
@@ -521,10 +526,6 @@ fn row_to_ss(row: &rusqlite::Row) -> rusqlite::Result<Screenshot> {
     })
 }
 
-/// Returns a hex color for a built-in category name (case-insensitive).
-/// Matches English canonical names used by the LLM (Music, Film/TV, Code/Tech, …)
-/// and legacy Turkish aliases for backward compatibility.
-/// Custom categories carry their own color and bypass this function.
 pub fn category_color(name: &str) -> String {
     let n = name.to_lowercase();
     if n.contains("music") || n.contains("müzik") || n.contains("muzik") { return "#a855f7".into(); }
@@ -542,7 +543,6 @@ pub fn category_color(name: &str) -> String {
     "#6b7280".into()
 }
 
-/// Returns an emoji icon for a built-in category name.
 pub fn category_icon(name: &str) -> String {
     let n = name.to_lowercase();
     if n.contains("music") || n.contains("müzik") || n.contains("muzik") { return "🎵".into(); }

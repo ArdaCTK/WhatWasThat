@@ -12,7 +12,6 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 const PORT: u16 = 27484;
-// FIX: align with Cargo.toml version
 const VERSION: &str = "1.0.0";
 const BASE_CORS: &str = "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-API-Key\r\nVary: Origin\r\n";
 
@@ -21,13 +20,18 @@ fn limiter() -> &'static Mutex<HashMap<String, (Instant, u32)>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn hit_rate_limit(key: &str, limit_per_min: u32) -> bool {
+// FIX: rate limit key is now the API token, not the peer IP.
+// All connections to localhost share the same IP (127.0.0.1), making an
+// IP-based limiter completely ineffective — every caller hit the same bucket.
+fn hit_rate_limit(token_key: &str, limit_per_min: u32) -> bool {
     if limit_per_min == 0 { return true; }
-    let now = Instant::now(); let mut guard = limiter().lock().ok();
+    let now = Instant::now();
+    let mut guard = limiter().lock().ok();
     let Some(map) = guard.as_mut() else { return false; };
-    let entry = map.entry(key.to_string()).or_insert((now, 0));
+    let entry = map.entry(token_key.to_string()).or_insert((now, 0));
     if now.duration_since(entry.0) > Duration::from_secs(60) { *entry = (now, 1); return false; }
-    entry.1 += 1; entry.1 > limit_per_min
+    entry.1 += 1;
+    entry.1 > limit_per_min
 }
 
 fn wildcard_match(pattern: &str, value: &str) -> bool {
@@ -70,7 +74,6 @@ pub async fn start_api_server(db: Arc<Database>, images_dir: PathBuf, app_handle
 }
 
 async fn handle_connection(mut stream: tokio::net::TcpStream, db: Arc<Database>, images_dir: PathBuf, app_handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let peer_key = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "local".to_string());
     let settings = db.load_settings();
     let mut reader = BufReader::new(&mut stream);
     let mut req_line = String::new(); reader.read_line(&mut req_line).await?;
@@ -90,7 +93,14 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, db: Arc<Database>,
     if path != "/api/ping" {
         if !is_origin_allowed(origin, &settings.local_api_allowed_origins) { write_json(&mut stream, 403, r#"{"error":"Origin not allowed"}"#, &cors).await?; stream.flush().await?; return Ok(()); }
         if !is_authorized(&headers, &settings.local_api_token) { write_json(&mut stream, 401, r#"{"error":"Unauthorized"}"#, &cors).await?; stream.flush().await?; return Ok(()); }
-        if hit_rate_limit(&peer_key, settings.local_api_rate_limit_per_min) { write_json(&mut stream, 429, r#"{"error":"Rate limit exceeded"}"#, &cors).await?; stream.flush().await?; return Ok(()); }
+        // FIX: use token as rate limit key so each client has its own bucket.
+        // Previously used peer IP which is always 127.0.0.1 on localhost.
+        let token_key = extract_api_key(&headers).unwrap_or_else(|| "anonymous".to_string());
+        if hit_rate_limit(&token_key, settings.local_api_rate_limit_per_min) {
+            write_json(&mut stream, 429, r#"{"error":"Rate limit exceeded"}"#, &cors).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
     }
     match (method, path) {
         ("GET" | "HEAD", "/api/ping") => { let body = format!(r#"{{"ok":true,"app":"WhatWasThat","version":"{}"}}"#, VERSION); write_json(&mut stream, 200, &body, &cors).await?; }

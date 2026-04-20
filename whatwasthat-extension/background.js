@@ -1,16 +1,38 @@
-﻿const DEFAULT_PORT = 27484;
+const DEFAULT_PORT = 27484;
 const ICON_WARN = 'WARN';
 const ICON_OK = 'OK';
 const MAX_IMAGE_FETCH_BYTES = 20 * 1024 * 1024;
 
-function defaultSettings() {
-  return {
-    wwt_port: DEFAULT_PORT,
-    auto_capture: false,
-    show_badge: true,
-    capture_quality: 90,
-    api_token: ''
-  };
+// FIX: split settings storage — non-sensitive settings sync across devices,
+// but the API token stays in local storage only.
+// Previously ALL settings (including the token) went to chrome.storage.sync,
+// which uploads data to Google's servers and pushes it to all signed-in Chrome
+// instances. The local API token is only valid on localhost and should never
+// leave the machine.
+const SYNC_DEFAULTS = {
+  wwt_port: DEFAULT_PORT,
+  auto_capture: false,
+  show_badge: true,
+  capture_quality: 90,
+};
+const LOCAL_DEFAULTS = {
+  api_token: '',
+};
+
+async function getSettings() {
+  const [syncPart, localPart] = await Promise.all([
+    chrome.storage.sync.get(SYNC_DEFAULTS),
+    chrome.storage.local.get(LOCAL_DEFAULTS),
+  ]);
+  return { ...syncPart, ...localPart };
+}
+
+async function saveSettings(settings) {
+  const { api_token, ...syncable } = settings;
+  await Promise.all([
+    chrome.storage.sync.set(syncable),
+    chrome.storage.local.set({ api_token: api_token ?? '' }),
+  ]);
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -37,7 +59,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     }
   } catch (err) {
     console.error('[WWT] Error:', err);
-    showNotification('Error', normalizeError(err), 'failure');
+    showNotification('Error', normalizeError(err));
   }
 });
 
@@ -62,12 +84,27 @@ function assertTokenConfigured(settings) {
   }
 }
 
+// FIX: added size guard on tab capture.
+// captureVisibleTab can return 5–15 MB on 4K displays — previously no check.
+// We attempt a standard quality capture first. If it exceeds the limit, we
+// retry at 60% JPEG quality, which typically drops size by ~70%.
 async function captureAndSendTab(tab) {
   const { settings } = await buildApiContext();
   assertTokenConfigured(settings);
 
   const quality = Math.max(50, Math.min(100, parseInt(settings.capture_quality, 10) || 90));
-  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png', quality });
+  let dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality });
+
+  // Rough byte estimate: base64 encodes 3 bytes → 4 chars
+  const estimatedBytes = Math.ceil((dataUrl.length * 3) / 4);
+  if (estimatedBytes > MAX_IMAGE_FETCH_BYTES) {
+    // Retry with reduced quality to get under the limit
+    dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 60 });
+    const retryBytes = Math.ceil((dataUrl.length * 3) / 4);
+    if (retryBytes > MAX_IMAGE_FETCH_BYTES) {
+      throw new Error(`Screenshot too large (${Math.round(retryBytes / 1024 / 1024)} MB). Try a smaller viewport.`);
+    }
+  }
 
   const payload = {
     type: 'screenshot',
@@ -113,7 +150,7 @@ async function sendSelection(tab, selectionText, pageUrl) {
   assertTokenConfigured(settings);
 
   const quality = Math.max(50, Math.min(100, parseInt(settings.capture_quality, 10) || 85));
-  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png', quality });
+  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality });
 
   const payload = {
     type: 'selection',
@@ -206,14 +243,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
   }
 });
-
-async function getSettings() {
-  return chrome.storage.sync.get(defaultSettings());
-}
-
-async function saveSettings(settings) {
-  await chrome.storage.sync.set(settings);
-}
 
 function blobToDataURL(blob) {
   return new Promise((resolve, reject) => {

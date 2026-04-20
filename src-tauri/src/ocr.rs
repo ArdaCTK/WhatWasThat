@@ -23,88 +23,79 @@ pub fn find_tesseract_binary() -> Option<String> {
     None
 }
 
-/// OCR IMPROVEMENTS:
-/// 1. Preprocess small images: scale up to ≥1400px wide so characters are large
-///    enough for Tesseract's LSTM engine to read accurately.
-/// 2. Try three PSM (page segmentation mode) values and keep the richest result:
-///    - PSM 3: fully automatic (default) — good for mixed content screenshots
-///    - PSM 6: single uniform text block — good for code, documents, forms
-///    - PSM 11: sparse text — good for UI screenshots with scattered labels
-/// 3. Use OEM 1 (LSTM-only engine) instead of OEM 3 (legacy+LSTM hybrid).
-///    LSTM consistently produces higher accuracy on modern fonts.
-/// 4. preserve_interword_spaces=1 preserves word spacing for better readability.
+// FIX: previously ran all three PSM modes unconditionally (3× the OCR time per image).
+// Now: try PSM 3 (automatic) first. If that yields ≥ 8 words we're done.
+// Only fall back to PSM 6 (uniform text block) or PSM 11 (sparse text) when the
+// first pass is sparse — covering screenshots with minimal or scattered text.
 pub fn run_ocr(image_path: &Path, lang: &str) -> Result<String, String> {
     let binary = match find_tesseract_binary() {
         Some(b) => b,
         None => { return Ok(String::new()); }
     };
 
-    // Preprocess: scale up images that are too small for reliable OCR
     let preprocessed = preprocess_for_ocr(image_path);
     let ocr_source = preprocessed.as_deref().unwrap_or(image_path);
 
-    // Run three PSM modes; keep the result with the most words
-    let psm_modes = ["3", "6", "11"];
-    let mut best_text = String::new();
-    let mut best_word_count = 0usize;
+    // First pass: PSM 3 (fully automatic — best general-purpose mode)
+    let first = run_psm_once(ocr_source, lang, "3", &binary);
+    let first_wc = first.split_whitespace().count();
 
-    for psm in &psm_modes {
-        let out = command_no_window(&binary)
-            .arg(ocr_source.to_str().unwrap_or(""))
-            .arg("stdout")
-            .arg("-l").arg(lang)
-            .arg("--psm").arg(psm)
-            .arg("--oem").arg("1")               // LSTM engine — best accuracy
-            .arg("-c").arg("preserve_interword_spaces=1")
-            .arg("-c").arg("tessedit_do_invert=0") // don't invert colors
-            .output();
+    let result = if first_wc >= 8 {
+        // Good result — no need to run additional passes
+        first
+    } else {
+        // Sparse result: try PSM 6 (uniform text block) and PSM 11 (sparse text)
+        let second = run_psm_once(ocr_source, lang, "6", &binary);
+        let second_wc = second.split_whitespace().count();
 
-        if let Ok(o) = out {
-            if o.status.success() {
-                let text = clean_ocr_text(&String::from_utf8_lossy(&o.stdout));
-                let wc = text.split_whitespace().count();
-                if wc > best_word_count {
-                    best_word_count = wc;
-                    best_text = text;
-                }
-            }
+        let third = run_psm_once(ocr_source, lang, "11", &binary);
+        let third_wc = third.split_whitespace().count();
+
+        // Keep whichever pass produced the most words
+        if first_wc >= second_wc && first_wc >= third_wc {
+            first
+        } else if second_wc >= third_wc {
+            second
+        } else {
+            third
         }
-    }
+    };
 
-    // Clean up temp preprocessing file
     if let Some(ref p) = preprocessed {
         let _ = std::fs::remove_file(p);
     }
 
-    Ok(best_text)
+    Ok(result)
 }
 
-/// Scale up images narrower than 1400px so Tesseract can reliably detect
-/// characters. Screenshots taken on high-DPI displays are usually ≥1920px
-/// and need no scaling. Small crops or mobile screenshots benefit greatly.
-/// Returns Some(temp_path) if scaling was applied, None if not needed.
+/// Run Tesseract with a single PSM mode and return cleaned text.
+fn run_psm_once(ocr_source: &Path, lang: &str, psm: &str, binary: &str) -> String {
+    let out = command_no_window(binary)
+        .arg(ocr_source.to_str().unwrap_or(""))
+        .arg("stdout")
+        .arg("-l").arg(lang)
+        .arg("--psm").arg(psm)
+        .arg("--oem").arg("1")
+        .arg("-c").arg("preserve_interword_spaces=1")
+        .arg("-c").arg("tessedit_do_invert=0")
+        .output();
+
+    match out {
+        Ok(o) if o.status.success() => clean_ocr_text(&String::from_utf8_lossy(&o.stdout)),
+        _ => String::new(),
+    }
+}
+
 fn preprocess_for_ocr(image_path: &Path) -> Option<std::path::PathBuf> {
     let img = image::open(image_path).ok()?;
     let (w, _h) = img.dimensions();
-
-    // Tesseract works best when the narrowest text is ≥20px tall.
-    // 1400px width is a safe floor for most screenshot content.
     let min_width = 1400u32;
-    if w >= min_width {
-        return None; // no preprocessing needed
-    }
-
-    // Scale up (cap at 3× to avoid huge files)
+    if w >= min_width { return None; }
     let scale = (min_width as f32 / w as f32).min(3.0);
     let nw = (w as f32 * scale) as u32;
     let nh = (_h as f32 * scale) as u32;
     let scaled = img.resize(nw, nh, image::imageops::FilterType::Lanczos3);
-
-    // Save adjacent to original with a hidden prefix so it's easy to clean up
-    let stem = image_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("img");
+    let stem = image_path.file_stem().and_then(|s| s.to_str()).unwrap_or("img");
     let tmp = image_path.with_file_name(format!(".{}_ocr_pre.png", stem));
     scaled.save(&tmp).ok()?;
     Some(tmp)
